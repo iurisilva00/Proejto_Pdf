@@ -1,50 +1,28 @@
-import pandas as pd
-import numpy as np
-# Define o número máximo de colunas e linhas
-pd.set_option('display.max_columns', None)
-pd.set_option('display.max_rows', None)
-import warnings      # Importa o módulo warnings para controlar avisos
-warnings.filterwarnings("ignore")  # Configura para ignorar avisos
-from pyspark.sql.functions import col
-import pandas as pd
-from office365.sharepoint.client_context import ClientContext
-from office365.runtime.auth.user_credential import UserCredential
-from io import BytesIO
-import xlrd
-import datetime
-from datetime import datetime, timedelta
-from locale import setlocale, LC_TIME
-from requests_ntlm import HttpNtlmAuth
-import pandas as pd
-import locale
-from datetime import datetime
-import re
 import os
-import unidecode
-import camelot
+import time
+import re
+import tempfile
+from datetime import datetime
 from office365.sharepoint.client_context import ClientContext
 from office365.sharepoint.files.file import File
 from office365.runtime.auth.user_credential import UserCredential
-import camelot
-import re
-import time
-import concurrent.futures
-from concurrent.futures import ThreadPoolExecutor
-import fitz  # PyMuPDF
-import time
 from dotenv import load_dotenv
+import fitz  # PyMuPDF
+import pandas as pd
 
+# Carregar variáveis de ambiente do arquivo .env
 load_dotenv()
 password = os.getenv("password")
-username = os.getenv("username")
+username = "00027336@progen.com.br"
 site_url = os.getenv("site_url")
-now= datetime.now()
-dia =now.day
+
+# Obter data e hora atuais
+now = datetime.now()
 ano = now.strftime('%Y')
 mes = now.strftime('%m')
-numero_medicao="10"
+numero_medicao = "10"
 ultima_medicao = f"{numero_medicao}{mes}{ano}"
-
+erros = []
 
 # Função para criar o contexto do cliente com reconexão
 def criar_contexto():
@@ -54,69 +32,81 @@ def criar_contexto():
 # Inicializar o contexto do cliente
 ctx = criar_contexto()
 
-# Lista para armazenar os dados extraídos dos PDFs
-dados_extraidos = []
+# Função para buscar arquivos em pastas e subpastas no SharePoint
+from requests.exceptions import HTTPError
 
-# Função para buscar arquivos em pastas e subpastas
 def buscar_arquivos_em_pastas(folder_url):
-    folder = ctx.web.get_folder_by_server_relative_url(folder_url)
-    ctx.load(folder)
-    ctx.execute_query()
-    
-    # Carregar e iterar sobre os arquivos na pasta atual
-    files = folder.files
-    ctx.load(files)
-    ctx.execute_query()
+    tentativas = 0
+    max_tentativas = 3
 
-    for file in files:
-        if re.search(r'620|RF', file.properties['Name'], re.IGNORECASE) and file.properties['Name'].endswith('.pdf'):
-            yield file
+    while tentativas < max_tentativas:
+        try:
+            folder = ctx.web.get_folder_by_server_relative_url(folder_url)
+            ctx.load(folder)
+            ctx.execute_query()
+            
+            files = folder.files
+            ctx.load(files)
+            ctx.execute_query()
 
-    # Carregar e iterar sobre subpastas
-    subfolders = folder.folders
-    ctx.load(subfolders)
-    ctx.execute_query()
-    for subfolder in subfolders:
-        time.sleep(1)
-        yield from buscar_arquivos_em_pastas(subfolder.properties['ServerRelativeUrl'])
+            for file in files:
+                if re.search(r'NFS', file.properties['Name'], re.IGNORECASE) and file.properties['Name'].endswith('.pdf'):
+                    print(f"Encontrado arquivo: {file.properties['Name']}")
+                    yield file
 
-# Função para extrair texto da primeira página do PDF
+            subfolders = folder.folders
+            ctx.load(subfolders)
+            ctx.execute_query()
+
+            for subfolder in subfolders:
+                time.sleep(2)  # Intervalo entre subpastas
+                yield from buscar_arquivos_em_pastas(subfolder.properties['ServerRelativeUrl'])
+
+            break  # Sai do loop se tudo der certo
+        except HTTPError as e:
+            if e.response.status_code == 429:
+                tentativas += 1
+                print(f"Erro 429: Tentando novamente ({tentativas}/{max_tentativas})...")
+                time.sleep(5)  # Espera antes de tentar novamente
+            else:
+                raise  # Re-levanta o erro se não for 429
+
+# Função para extrair texto do PDF usando PyMuPDF
 def extrair_texto_pdf(file_url):
     global ctx
     tentativas = 0
     max_tentativas = 3
-    
+
     while tentativas < max_tentativas:
         try:
             # Baixa o PDF do SharePoint
             response = File.open_binary(ctx, file_url)
             
-            # Salva o PDF temporariamente
-            with open("temp.pdf", "wb") as temp_pdf:
+            # Cria um arquivo temporário para armazenar o PDF baixado
+            with tempfile.NamedTemporaryFile(delete=False, suffix=".pdf") as temp_pdf:
                 temp_pdf.write(response.content)
+                temp_pdf_path = temp_pdf.name
             
-            # Extrair texto da primeira página usando PyMuPDF
-            try:
-                pdf_document = fitz.open("temp.pdf")
-                
-                print(f"Processando o arquivo: {file_url.split('/')[-1]}")
-                page = pdf_document[0]  # Apenas a primeira página
-                text = page.get_text("text")  # Extrai o texto em formato simples
-                print(f"Texto da primeira página:\n{text}")
-                
-                # Armazenar os dados extraídos
-                dados_extraidos.append({
-                    'Arquivo': file_url.split('/')[-1],
-                    'Texto': text
-                })
-                
-                pdf_document.close()
+            # Verificar se o arquivo foi escrito corretamente
+            if not os.path.exists(temp_pdf_path):
+                raise FileNotFoundError(f"Arquivo temporário não encontrado: {temp_pdf_path}")
+            
+            # Extrair texto diretamente do PDF usando PyMuPDF
+            texto_extraido = ""
+            with fitz.open(temp_pdf_path) as pdf:
+                for page in pdf:
+                    texto_extraido += page.get_text()  # Extrai o texto da página
+            
+            # Remover arquivos temporários
+            os.remove(temp_pdf_path)
+            
+            print(f"Texto extraído do arquivo {file_url.split('/')[-1]}:\n{texto_extraido[:200]}...")  # Exibe apenas os primeiros 200 caracteres
+            
+            # Retornar os dados extraídos (nome do arquivo e texto extraído)
+            return (file_url.split('/')[-1], texto_extraido)
 
-            except Exception as e:
-                print(f"Erro ao processar texto no arquivo {file_url.split('/')[-1]}: {e}")
-            break
         except Exception as e:
-            print(f"Erro ao acessar o arquivo {file_url.split('/')[-1]}: {e}")
+            print(f"Erro ao processar texto no arquivo {file_url.split('/')[-1]}: {e}")
             tentativas += 1
             if tentativas < max_tentativas:
                 print(f"Tentando reconectar... (tentativa {tentativas} de {max_tentativas})")
@@ -124,32 +114,42 @@ def extrair_texto_pdf(file_url):
                 time.sleep(2)
             else:
                 print(f"Falha após {max_tentativas} tentativas.")
+                erros.append(file_url.split('/')[-1])
+    return (file_url.split('/')[-1], "")
 
-# URL da pasta inicial no SharePoint
+# URL da pasta inicial no SharePoint onde os PDFs estão armazenados
 initial_folder_url = '/sites/GerenciamentodaConstruo2/Documentos Compartilhados/General/11 - FATURAMENTO'
 
-# Função para processar arquivos usando ThreadPoolExecutor
-def processar_arquivos_concurrently():
-    with ThreadPoolExecutor(max_workers=5) as executor:  # Ajuste `max_workers` conforme necessário
-        futures = []
-        for arquivo in buscar_arquivos_em_pastas(initial_folder_url):
-            print(f"Enfileirando arquivo: {arquivo.properties['Name']}")
-            futures.append(executor.submit(extrair_texto_pdf, arquivo.properties["ServerRelativeUrl"]))
-        
-        # Aguardar a conclusão de todos os arquivos
-        for future in futures:
-            future.result()
+# Buscar arquivos no SharePoint e processá-los
+print("Buscando arquivos no SharePoint...")
+arquivos = list(buscar_arquivos_em_pastas(initial_folder_url))
+print(f"Total de arquivos encontrados: {len(arquivos)}")
 
-# Função para exportar dados para CSV
-def exportar_para_csv():
-    # Converter os dados extraídos para um DataFrame
-    df = pd.DataFrame(dados_extraidos)
-    
-    # Exportar para CSV
-    df.to_csv('dados_extraidos.csv', index=False, encoding='utf-8')
-    print("Arquivo CSV exportado com sucesso!")
+# Extrair texto de cada arquivo PDF encontrado
+resultados = []
+for arquivo in arquivos:
+    file_url = arquivo.properties["ServerRelativeUrl"]
+    nome_arquivo, texto = extrair_texto_pdf(file_url)
+    resultados.append({"Arquivo": nome_arquivo, "Texto": texto})
 
-# Iniciar a execução
-if __name__ == "__main__":
-    processar_arquivos_concurrently()
-    exportar_para_csv()
+def sanitize_column_names(df):
+    # Converta os nomes das colunas para strings
+    df.columns = df.columns.astype(str)
+    # Substitua caracteres inválidos nos nomes das colunas
+    df.columns = df.columns.str.replace(r'[^A-Za-z0-9_]', '', regex=True)
+    return df
+
+
+# Exportar os dados extraídos para um arquivo Excel
+print("Exportando resultados...")
+df_resultados = pd.DataFrame(resultados)
+df_resultados = sanitize_column_names(df_resultados)
+df_resultados.to_json("dados_extraidos.json", index=False)
+print("Arquivo Excel exportado com sucesso!")
+
+# Exportar lista de arquivos com erro
+print("Exportando arquivos com erro...")
+df_erros = pd.DataFrame(erros)
+df_erros = sanitize_column_names(df_erros)
+df_erros.to_json("arquivos_com_erro.json", index=False)
+print("Arquivos com erro exportados com sucesso!")
